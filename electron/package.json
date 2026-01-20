@@ -1,0 +1,22 @@
+{
+  "name": "local-subtitle-tool",
+  "version": "1.0.0",
+  "description": "Local video subtitle generator using faster-whisper",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [
+    "subtitle",
+    "whisper",
+    "electron"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^34.0.0"
+  },
+  "dependencies": {
+    "fluent-ffmpeg": "^2.1.3"
+  }
+}
