@@ -2,6 +2,7 @@ import os
 import time
 import socket
 import shutil
+import sys
 # 强制设置 HF 镜像，确保在任何网络环境下都能走国内源
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "0"
@@ -125,7 +126,7 @@ def download_model_by_id(model_id, progress_callback=None):
 
     output_dir = os.path.join(MODELS_DIR, model_id)
     
-    print(f"PROGRESS MODEL_DOWNLOAD_START {model_id}", flush=True)
+    print(f"PROGRESS MODEL_DOWNLOAD_START {model_id}", file=sys.stderr, flush=True)
     
     # faster-whisper 的 download_model 没有直接的进度回调暴露给 Python 代码
     # (它底层用 huggingface_hub，会有 stderr 进度条)
@@ -138,16 +139,16 @@ def download_model_by_id(model_id, progress_callback=None):
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            print(f"PROGRESS INFO Debug: Starting download attempt {attempt + 1}/{max_retries}...", flush=True)
+            print(f"PROGRESS INFO Debug: Starting download attempt {attempt + 1}/{max_retries}...", file=sys.stderr, flush=True)
             model_path = download_model(model_id, output_dir=output_dir)
-            print(f"PROGRESS MODEL_DOWNLOAD_DONE {model_id}", flush=True)
+            print(f"PROGRESS MODEL_DOWNLOAD_DONE {model_id}", file=sys.stderr, flush=True)
             return model_path
         except Exception as e:
-            print(f"PROGRESS INFO Debug: Download attempt {attempt + 1} failed: {str(e)}", flush=True)
+            print(f"PROGRESS INFO Debug: Download attempt {attempt + 1} failed: {str(e)}", file=sys.stderr, flush=True)
             if attempt < max_retries - 1:
                 wait_time = (attempt + 1) * 2
-                print(f"PROGRESS INFO Debug: Retrying in {wait_time} seconds...", flush=True)
+                print(f"PROGRESS INFO Debug: Retrying in {wait_time} seconds...", file=sys.stderr, flush=True)
                 time.sleep(wait_time)
             else:
-                print(f"PROGRESS MODEL_DOWNLOAD_ERROR {str(e)}", flush=True)
+                print(f"PROGRESS MODEL_DOWNLOAD_ERROR {str(e)}", file=sys.stderr, flush=True)
                 raise e

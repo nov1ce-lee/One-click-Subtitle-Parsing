@@ -17,8 +17,11 @@
         <div class="card sidebar">
             <div id="drop-zone" class="drop-zone">
                 <p>Drag & Drop Video/Audio Here</p>
-                <button class="btn btn-secondary btn-sm" id="select-file-btn" style="margin-top: 10px;">Or Select File</button>
-                <div id="file-info" class="file-info"></div>
+                <button class="btn btn-secondary btn-sm" id="select-file-btn" style="margin-top: 10px;">Add Files</button>
+                <div id="file-list" class="file-list">
+                    <!-- Files will be listed here -->
+                </div>
+                <button id="clear-list-btn" class="btn btn-secondary btn-sm" style="display: none; margin-top: 5px;">Clear List</button>
             </div>
 
             <div class="form-group">
@@ -47,7 +50,10 @@
                 </label>
             </div>
 
-            <button id="start-btn" class="btn btn-primary" disabled>Start Transcription</button>
+            <div style="display: flex; gap: 10px;">
+                <button id="start-btn" class="btn btn-primary" style="flex: 1;" disabled>Start Transcription</button>
+                <button id="cancel-btn" class="btn btn-danger" style="flex: 1; display: none;">Stop</button>
+            </div>
             
             <div style="margin-top: 10px; display: none;" id="open-folder-container">
                  <button id="open-folder-btn" class="btn btn-secondary">Open Output Folder</button>

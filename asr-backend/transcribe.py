@@ -16,6 +16,26 @@ warnings.filterwarnings("ignore", message="The `local_dir_use_symlinks` argument
 
 # Configure stdout to use utf-8 explicitly to avoid encoding errors on Windows
 sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
+# --- Logging Helper ---
+def log_info(message):
+    """Print log messages to stderr to keep stdout clean for JSON IPC"""
+    sys.stderr.write(f"INFO: {message}\n")
+    sys.stderr.flush()
+
+def log_error(message):
+    """Print error messages to stderr"""
+    sys.stderr.write(f"ERROR: {message}\n")
+    sys.stderr.flush()
+
+def ipc_send(data_type, payload):
+    """Send structured data to stdout as JSON"""
+    message = {
+        "type": data_type,
+        "payload": payload
+    }
+    print(json.dumps(message, ensure_ascii=False), flush=True)
 
 # Add local bin to PATH (for ffmpeg if downloaded locally)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -41,11 +61,11 @@ try:
     ctypes.CDLL(os.path.join(current_dir, "cudnn_cnn64_9.dll"))
     ctypes.CDLL(os.path.join(current_dir, "cudnn_adv64_9.dll"))
     
-    print("PROGRESS INFO Debug: Successfully pre-loaded NVIDIA DLLs", flush=True)
+    log_info("Successfully pre-loaded NVIDIA DLLs")
 except Exception as e:
     # It's okay if this fails, maybe they are already loaded or not found
     # We just print a warning but don't stop
-    print(f"PROGRESS INFO Debug: Warning: Could not pre-load NVIDIA DLLs: {e}", flush=True)
+    log_info(f"Warning: Could not pre-load NVIDIA DLLs: {e}")
 
 # Try to add NVIDIA libs to PATH if they exist in site-packages
 # This is a hack because CTranslate2 expects DLLs in PATH
@@ -68,9 +88,8 @@ def add_nvidia_libs_to_path():
 add_nvidia_libs_to_path()
 
 # Debug: Print arguments and CWD to stderr to avoid polluting stdout (which breaks JSON parsing)
-sys.stderr.write(f"PROGRESS INFO Debug: argv={sys.argv}\n")
-sys.stderr.write(f"PROGRESS INFO Debug: cwd={os.getcwd()}\n")
-sys.stderr.flush()
+log_info(f"argv={sys.argv}")
+log_info(f"cwd={os.getcwd()}")
 
 def get_media_duration(file_path):
     try:
@@ -114,6 +133,11 @@ def main():
             # Force TQDM to show progress even if not TTY
             os.environ["TQDM_DISABLE"] = "0"
             models_manager.download_model_by_id(args.model_id)
+            # Use IPC format for download success
+            # But wait, main.js expects specific stdout for download?
+            # Actually, main.js for download currently parses stdout line by line looking for PROGRESS
+            # We should probably keep it simple for now or standardize.
+            # Let's standardize to stderr for logs and stdout for result.
             print(json.dumps({"success": True, "message": f"Model {args.model_id} downloaded"}, ensure_ascii=False))
         except Exception as e:
             print(json.dumps({"error": str(e)}, ensure_ascii=False))
@@ -126,8 +150,7 @@ def main():
         sys.exit(1)
 
     # 调试打印：确认接收到的路径
-    # 使用 repr 打印以显示原始字符，防止控制台乱码掩盖问题
-    print(f"PROGRESS INFO Debug: Input path received: {repr(args.input)}", flush=True)
+    log_info(f"Input path received: {repr(args.input)}")
 
     if not os.path.exists(args.input):
         print(json.dumps({"error": f"Input file not found: {args.input}"}, ensure_ascii=False))
@@ -137,7 +160,9 @@ def main():
     model_path = models_manager.get_model_path(args.model_id)
     if not model_path:
         # 尝试自动下载
-        print(f"PROGRESS INFO Model not found locally, downloading {args.model_id}...", flush=True)
+        log_info(f"Model not found locally, downloading {args.model_id}...")
+        # Send progress event to UI
+        ipc_send("progress", {"stage": "downloading_model", "model": args.model_id})
         try:
             model_path = models_manager.download_model_by_id(args.model_id)
         except Exception as e:
@@ -147,74 +172,71 @@ def main():
     # 获取时长用于进度计算
     duration = get_media_duration(args.input)
     if duration:
-        print(f"PROGRESS INFO Media duration: {duration:.2f}s", flush=True)
+        log_info(f"Media duration: {duration:.2f}s")
 
     # 加载模型
-    print("PROGRESS LOAD_MODEL Loading model...", flush=True)
+    log_info("Loading model...")
+    ipc_send("progress", {"stage": "loading_model"})
+    
     try:
         # DEBUG: Print model loading params
-        print(f"PROGRESS INFO Debug: Loading WhisperModel from {model_path}", flush=True)
+        log_info(f"Loading WhisperModel from {model_path}")
         
         try:
             # 尝试使用用户指定的设备
             requested_device = args.device
-            print(f"PROGRESS INFO Debug: Requested device={requested_device}", flush=True)
+            log_info(f"Requested device={requested_device}")
 
             if requested_device == "cuda":
                 # 用户强制请求 CUDA
                 try:
                     # 尝试加载，如果失败则捕获详细信息
-                    print(f"PROGRESS INFO Debug: Attempting to load model on CUDA...", flush=True)
+                    log_info("Attempting to load model on CUDA...")
                     model = WhisperModel(model_path, device="cuda", compute_type="int8")
                 except Exception as e:
                     error_str = str(e)
-                    print(f"PROGRESS INFO Debug: CUDA load failed: {error_str}", flush=True)
+                    log_info(f"CUDA load failed: {error_str}")
                     
                     if "cublas" in error_str.lower() or "cudnn" in error_str.lower():
-                         print("PROGRESS INFO Debug: Missing CUDA/cuDNN libraries. Please install cuDNN 8.x for CUDA 11/12.", flush=True)
+                         log_info("Missing CUDA/cuDNN libraries. Please install cuDNN 8.x for CUDA 11/12.")
                     
-                    print(f"PROGRESS INFO Debug: Falling back to CPU...", flush=True)
+                    log_info("Falling back to CPU...")
                     model = WhisperModel(model_path, device="cpu", compute_type="int8")
             elif requested_device == "auto":
                  # 自动尝试
                  try:
                     model = WhisperModel(model_path, device="auto", compute_type="int8")
                  except Exception as e:
-                    print(f"PROGRESS INFO Debug: Auto device failed ({e}), falling back to CPU", flush=True)
+                    log_info(f"Auto device failed ({e}), falling back to CPU")
                     model = WhisperModel(model_path, device="cpu", compute_type="int8")
             else:
                  # 默认 CPU
                  model = WhisperModel(model_path, device="cpu", compute_type="int8")
              
         except Exception as e_cpu:
-             print(f"PROGRESS INFO Debug: 'cpu' device failed ({e_cpu}), trying auto", flush=True)
+             log_info(f"'cpu' device failed ({e_cpu}), trying auto")
              model = WhisperModel(model_path, device="auto", compute_type="int8")
              
-        print("PROGRESS INFO Debug: Model loaded successfully", flush=True)
+        log_info("Model loaded successfully")
     except Exception as e:
         print(json.dumps({"error": f"Failed to load model: {str(e)}"}, ensure_ascii=False))
         sys.exit(1)
 
-    print("PROGRESS TRANSCRIBE_START Starting transcription...", flush=True)
+    log_info("Starting transcription...")
+    ipc_send("progress", {"stage": "transcribing"})
     
     # Use initial_prompt to guide the model to output Simplified Chinese
-    # This is effective when the language is Chinese or Auto (and turns out to be Chinese)
     initial_prompt = None
     if args.language in ["auto", "zh"]:
         initial_prompt = "简体中文"
 
-    # VAD filter can sometimes cause missing segments in audio with background music
-    # We disable it by default or make it less aggressive. 
-    # Also, we can increase beam_size and temperature to improve recall.
-    
-    # Pre-convert audio to 16kHz mono wav to avoid "tuple index out of range" errors
-    # and improve compatibility with ffmpeg decoding in faster-whisper
+    # Pre-convert audio to 16kHz mono wav
     import tempfile
     
     temp_wav = None
     transcribe_input = args.input
     
-    print("PROGRESS INFO Debug: Pre-processing audio to 16kHz mono wav...", flush=True)
+    log_info("Pre-processing audio to 16kHz mono wav...")
 
     safe_input_path = args.input
     temp_input_copy = None
@@ -325,11 +347,11 @@ def main():
                 last_error = str(e)
 
     if not temp_wav:
-        print(f"PROGRESS INFO Debug: Audio extraction failed, fallback to original input. Reason: {last_error or 'Unknown error'}", flush=True)
+        log_info(f"Audio extraction failed, fallback to original input. Reason: {last_error or 'Unknown error'}")
         transcribe_input = safe_input_path
     else:
         transcribe_input = temp_wav
-        print(f"PROGRESS INFO Debug: Audio converted to {temp_wav} (Size: {os.path.getsize(temp_wav)} bytes)", flush=True)
+        log_info(f"Audio converted to {temp_wav} (Size: {os.path.getsize(temp_wav)} bytes)")
 
 
     try:
@@ -338,9 +360,9 @@ def main():
             language=None if args.language == "auto" else args.language,
             beam_size=5,
             best_of=5,
-            vad_filter=False, # Disable VAD to prevent missing segments in music/noise
-            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0], # Retry with higher temp if low confidence
-            condition_on_previous_text=False, # Prevent loop/hallucination propagation
+            vad_filter=False, 
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0], 
+            condition_on_previous_text=False, 
             initial_prompt=initial_prompt
         )
         
@@ -350,25 +372,20 @@ def main():
              try:
                  cc = opencc.OpenCC('t2s')
              except Exception as e:
-                 print(f"PROGRESS INFO Debug: OpenCC init failed: {e}", flush=True)
+                 log_info(f"OpenCC init failed: {e}")
 
         # 实时收集结果
         segments_result = []
         
         for segment in segments_generator:
             # 发送进度
+            progress = 0.0
             if duration and duration > 0:
                 progress = min(segment.end / duration, 1.0)
-                print(f"PROGRESS TRANSCRIBE {progress:.4f}", flush=True)
             
             text = segment.text
             if cc:
                 text = cc.convert(text)
-
-            # Send current text for UI display
-            # Replace newlines to keep it on one line for simple parsing
-            safe_text = text.replace('\n', ' ')
-            print(f"PROGRESS DETAILS {safe_text}", flush=True)
 
             seg_data = {
                 "id": segment.id,
@@ -378,8 +395,11 @@ def main():
             }
             segments_result.append(seg_data)
             
-            # Real-time segment output for robustness against crashes
-            print(f"SEGMENT {json.dumps(seg_data, ensure_ascii=False)}", flush=True)
+            # Send structured segment update
+            ipc_send("segment", {
+                "segment": seg_data,
+                "progress": progress
+            })
 
         # 最终输出完整结果
         final_output = {
@@ -390,7 +410,9 @@ def main():
             "model_id": args.model_id
         }
         
-        print(json.dumps(final_output, ensure_ascii=False))
+        # Send final result (not wrapped in "payload" to keep backward compat or just use a type?)
+        # Let's use the new IPC format for everything.
+        ipc_send("complete", final_output)
         
     except Exception as e:
         print(json.dumps({"error": f"Transcription failed: {str(e)}"}, ensure_ascii=False))
@@ -410,8 +432,12 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        # Handle cancellation gracefully
+        log_info("Task cancelled by user.")
+        sys.exit(0)
     except Exception as e:
         import traceback
-        traceback.print_exc()
+        traceback.print_exc(file=sys.stderr)
         print(json.dumps({"error": f"Unhandled exception: {str(e)}"}, ensure_ascii=False))
         sys.exit(1)

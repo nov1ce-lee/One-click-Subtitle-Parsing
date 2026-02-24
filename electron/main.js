@@ -46,12 +46,12 @@ app.on('window-all-closed', function () {
 
 ipcMain.handle('select-file', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
-    properties: ['openFile'],
+    properties: ['openFile', 'multiSelections'],
     filters: [
       { name: 'Media Files', extensions: ['mp4', 'mov', 'mkv', 'avi', 'mp3', 'wav', 'm4a'] }
     ]
   });
-  return result.filePaths[0];
+  return result.filePaths;
 });
 
 ipcMain.handle('show-item-in-folder', async (event, path) => {
@@ -110,9 +110,32 @@ ipcMain.handle('download-model', async (event, modelId) => {
     const env = { ...process.env, HF_ENDPOINT: 'https://hf-mirror.com', TQDM_DISABLE: '0', HF_HUB_DISABLE_PROGRESS_BARS: '0' };
     const childProcess = spawn(pythonPath, [scriptPath, '--download-model', '--model-id', modelId], { env });
     
+    // Stdout should now only contain the final JSON result
     childProcess.stdout.on('data', (data) => {
       const output = data.toString();
       console.log('Download stdout:', output);
+      try {
+          const result = JSON.parse(output);
+          if (result.success) {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                  mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_DONE', value: modelId, modelId });
+              }
+          } else if (result.error) {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                  mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_ERROR', value: result.error, modelId });
+              }
+          }
+      } catch (e) {
+          // Ignore partial JSON
+      }
+    });
+
+    // Stderr contains progress logs
+    childProcess.stderr.on('data', (data) => {
+      const output = data.toString();
+      console.error('Download stderr:', output);
+      
+      // Parse legacy PROGRESS format from models_manager (now on stderr)
       const lines = output.split('\n');
       for (const line of lines) {
         const trimmed = line.trim();
@@ -120,29 +143,19 @@ ipcMain.handle('download-model', async (event, modelId) => {
           const parts = trimmed.split(' ');
           const type = parts[1];
           const value = parts.slice(2).join(' ');
+          
           if (mainWindow && !mainWindow.isDestroyed()) {
-            if (type === 'MODEL_DOWNLOAD_START') {
-              mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_START', value, modelId });
-            } else if (type === 'MODEL_DOWNLOAD_DONE') {
-              mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_DONE', value, modelId });
-            } else if (type === 'MODEL_DOWNLOAD_ERROR') {
-              mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_ERROR', value, modelId });
-            }
+             if (type === 'MODEL_DOWNLOAD_START') {
+                 mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_START', value, modelId });
+             } else if (type === 'MODEL_DOWNLOAD_DONE') {
+                 mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_DONE', value, modelId });
+             } else if (type === 'MODEL_DOWNLOAD_ERROR') {
+                 mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_ERROR', value, modelId });
+             }
           }
         }
-        const match = line.match(/(\d+)%/);
-        if (match && mainWindow && !mainWindow.isDestroyed()) {
-          const percent = parseInt(match[1], 10);
-          mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_PROGRESS', value: percent, modelId });
-        }
-      }
-    });
-
-    childProcess.stderr.on('data', (data) => {
-      const output = data.toString();
-      console.error('Download stderr:', output);
-      const lines = output.split('\n');
-      for (const line of lines) {
+        
+        // Parse TQDM progress
         const match = line.match(/(\d+)%/);
         if (match && mainWindow && !mainWindow.isDestroyed()) {
           const percent = parseInt(match[1], 10);
@@ -153,9 +166,7 @@ ipcMain.handle('download-model', async (event, modelId) => {
 
     childProcess.on('close', (code) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        if (code === 0) {
-          mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_DONE', value: modelId, modelId });
-        } else {
+        if (code !== 0) {
           mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_ERROR', value: `code ${code}`, modelId });
         }
       }
@@ -215,90 +226,99 @@ ipcMain.handle('start-transcription', (event, { inputPath, modelId, language, us
   let hasCompleted = false;
   let accumulatedSegments = [];
 
-  // 处理 stdout (包含进度和最终结果)
-  pythonProcess.stdout.on('data', (data) => {
-    const strData = data.toString();
-    console.log('Python stdout:', strData); // Debug logging
+  // Buffer to handle split chunks
+  let stdoutBuffer = '';
 
-    const lines = strData.split('\n');
+  // 处理 stdout (只包含 JSON)
+  pythonProcess.stdout.on('data', (data) => {
+    const chunk = data.toString();
+    stdoutBuffer += chunk;
+
+    const lines = stdoutBuffer.split('\n');
+    // Keep the last incomplete line in the buffer
+    stdoutBuffer = lines.pop();
+
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
 
-      // 修复：处理粘包问题（如果多个 PROGRESS 在一行，或者 PROGRESS 和 JSON 在一行）
-      
-      if (trimmed.startsWith('PROGRESS')) {
-        // 解析进度: PROGRESS TRANSCRIBE 0.1234
-        // 或者 PROGRESS INFO ...
-        // 注意：value 可能包含空格
-        const firstSpace = trimmed.indexOf(' ');
-        if (firstSpace === -1) continue;
+      try {
+        const message = JSON.parse(trimmed);
         
-        const rest = trimmed.slice(firstSpace + 1);
-        const secondSpace = rest.indexOf(' ');
-        
-        let type, value;
-        if (secondSpace === -1) {
-             type = rest;
-             value = '';
-        } else {
-             type = rest.slice(0, secondSpace);
-             value = rest.slice(secondSpace + 1);
+        // Handle Error
+        if (message.error) {
+            mainWindow.webContents.send('transcription-error', message.error);
+            hasCompleted = true; // Stop further processing
+            return;
         }
-        
-        mainWindow.webContents.send('transcription-progress', { type, value });
-      } else if (trimmed.startsWith('SEGMENT ')) {
-        // 实时收集 segment，用于崩溃恢复
-        try {
-           const jsonStr = trimmed.slice(8);
-           const seg = JSON.parse(jsonStr);
-           accumulatedSegments.push(seg);
-        } catch (e) {
-           console.error('Failed to parse segment:', e);
+
+        // Handle New IPC Format
+        if (message.type) {
+            switch (message.type) {
+                case 'progress':
+                    // payload: { stage: '...', model: '...' }
+                    const stage = message.payload.stage;
+                    if (stage === 'downloading_model') {
+                         mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_START', value: message.payload.model });
+                    } else if (stage === 'loading_model') {
+                         mainWindow.webContents.send('transcription-progress', { type: 'LOAD_MODEL' });
+                    } else if (stage === 'transcribing') {
+                         mainWindow.webContents.send('transcription-progress', { type: 'TRANSCRIBE', value: 0 });
+                    }
+                    break;
+                
+                case 'segment':
+                    // payload: { segment: {...}, progress: 0.5 }
+                    const seg = message.payload.segment;
+                    const prog = message.payload.progress;
+                    
+                    accumulatedSegments.push(seg);
+                    
+                    // Update progress bar
+                    mainWindow.webContents.send('transcription-progress', { type: 'TRANSCRIBE', value: prog });
+                    
+                    // Update live text (replace newlines for simple display)
+                    const safeText = seg.text.replace('\n', ' ');
+                    mainWindow.webContents.send('transcription-progress', { type: 'DETAILS', value: safeText });
+                    break;
+
+                case 'complete':
+                    // payload: { segments: [], ... }
+                    const result = message.payload;
+                    if (!hasCompleted) {
+                        mainWindow.webContents.send('transcription-complete', result);
+                        hasCompleted = true;
+                    }
+                    break;
+            }
+        } 
+        // Backward compatibility / Fallback for direct JSON dumps (like final error or result if not wrapped)
+        else if (message.segments) {
+             if (!hasCompleted) {
+                mainWindow.webContents.send('transcription-complete', message);
+                hasCompleted = true;
+            }
         }
-      } else if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
-        // 可能是最终结果 JSON
-        try {
-          const result = JSON.parse(trimmed);
-          // 只有当包含 segments 时才认为是最终结果，避免误判错误 JSON
-          if (result.segments || result.error) {
-              if (result.error) {
-                  mainWindow.webContents.send('transcription-error', result.error);
-                  // Mark as completed even if error, to prevent double reporting
-                  hasCompleted = true; 
-              } else {
-                  mainWindow.webContents.send('transcription-complete', result);
-                  hasCompleted = true;
-              }
-          }
-        } catch (e) {
-          console.error('Failed to parse result line:', trimmed);
-        }
+      } catch (e) {
+        console.error('Failed to parse JSON line:', trimmed, e);
       }
     }
   });
 
   pythonProcess.stderr.on('data', (data) => {
-    // 转换 buffer 为字符串，并解决可能的中文乱码（虽然 Buffer.toString 默认 utf8，但在 Windows console 有时是 gbk）
-    // 这里简单处理，直接 toString
     const errorMsg = data.toString();
-    console.error('Python stderr:', errorMsg); // Debug logging
+    console.error('Python stderr:', errorMsg); 
+    
+    // Send logs to frontend for debugging (optional, using INFO type)
+    if (errorMsg.startsWith('INFO:')) {
+        mainWindow.webContents.send('transcription-progress', { type: 'INFO', value: errorMsg.replace('INFO:', '').trim() });
+    }
 
-    // 尝试解析 tqdm 下载进度
-    // 格式示例: 10%|#         | 100M/1.0G [00:10<01:30, 10.0MB/s]
-    // 宽容匹配: 只要有数字后跟 % 且在 stderr 中，我们就认为是进度（通常是 tqdm）
-    // 或者匹配 "Downloading ... 12%" 这种
+    // Still try to parse TQDM progress from stderr if any (e.g. during model download inside transcribe.py)
     const percentMatch = errorMsg.match(/(\d+)%/);
     if (percentMatch) {
       const percent = parseInt(percentMatch[1], 10);
       mainWindow.webContents.send('transcription-progress', { type: 'DOWNLOAD_PROGRESS', value: percent });
-    } else {
-        // 有些时候 tqdm 输出的是 "\r 10% ..." 这种，match 也能匹配到
-        // 尝试匹配 "100/1000" 这种步数？不，太宽泛了。
-        // 看看有没有 "Downloading" 关键字
-        if (errorMsg.includes('Downloading') && errorMsg.includes('%')) {
-            // fallback logic
-        }
     }
   });
 
@@ -306,10 +326,12 @@ ipcMain.handle('start-transcription', (event, { inputPath, modelId, language, us
     console.log(`Transcription process exited with code ${code}`);
     pythonProcess = null;
     
-    // Ignore exit code 3221226505 if we already have a result
-    // 3221226505 (0xC0000409) is STATUS_STACK_BUFFER_OVERRUN, common in CTranslate2 on Windows
-    // In signed 32-bit integer, it is -1073740791
+    // 3221226505 (0xC0000409) is STATUS_STACK_BUFFER_OVERRUN
     const isStackBufferOverrun = (code === 3221226505 || code === -1073740791);
+    
+    // Check if it was killed manually (we usually set a flag or just check code)
+    // On Windows, taskkill might produce code 1 or 0 or 15. 
+    // If hasCompleted is true, we don't care.
     
     if (code !== 0 && !hasCompleted) {
        // Only report error if we haven't finished successfully
@@ -317,28 +339,26 @@ ipcMain.handle('start-transcription', (event, { inputPath, modelId, language, us
        if (isStackBufferOverrun) {
            console.log(`Ignored exit code ${code} (Status Stack Buffer Overrun).`);
            
-           // 尝试恢复：如果我们收集到了 segments，就视为成功
+           // Crash recovery
            if (accumulatedSegments.length > 0) {
                console.log("Recovering from crash using accumulated segments.");
                const result = {
                    segments: accumulatedSegments,
-                   duration: accumulatedSegments[accumulatedSegments.length - 1].end, // 近似时长
+                   duration: accumulatedSegments[accumulatedSegments.length - 1].end, 
                    language: 'unknown'
                };
                mainWindow.webContents.send('transcription-complete', result);
                return;
            }
-
-           // If we haven't completed, this is still bad, but maybe we can just warn?
-           // But if we haven't completed, we don't have the SRT data. 
-           // So we must report error OR try to recover if we have partial data?
-           // For now, let's report a friendlier error message.
            mainWindow.webContents.send('transcription-error', `Process finished with warning (Code ${code}). Please check if output is complete.`);
        } else {
+           // If code is null (killed by signal) or non-zero
+           // We might want to distinguish "User Cancelled" vs "Crash"
+           // But here we don't know if user cancelled easily unless we track it.
+           // However, if user cancelled, renderer usually knows it.
+           // We can just send an error or generic message.
            mainWindow.webContents.send('transcription-error', `Process exited with code ${code}`);
        }
-    } else if (hasCompleted && isStackBufferOverrun) {
-        console.log(`Ignored benign exit code ${code} after success.`);
     }
   });
 

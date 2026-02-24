@@ -1,101 +1,113 @@
-# 软件部署与打包指南
+# 软件部署与迁移指南
 
-## 1. 在新电脑上运行 (手动迁移)
+## 方案一：一键源码迁移 (推荐用于开发或调试)
 
-如果你只是想把现在的开发环境迁移到另一台电脑，或者直接分发解压包，请遵循以下步骤：
+这是最简单的方式，适合在另一台安装了 Python 和 Node.js 的电脑上快速运行。
 
 ### 前置要求
-1. **安装 Python 3.11+**: 目标电脑必须安装 Python (建议 3.11.9)。
-2. **NVIDIA 显卡驱动**: 如果使用 GPU 加速，确保安装了最新的 NVIDIA 驱动。
-3. **CUDA Toolkit (可选)**: 理论上我们的脚本会自动加载本地 DLL，但如果遇到问题，建议安装 CUDA 12.x。
+1.  **Python 3.11+**: [下载安装](https://www.python.org/downloads/) (安装时请勾选 "Add Python to PATH")
+2.  **Node.js (LTS)**: [下载安装](https://nodejs.org/)
+3.  **NVIDIA 显卡驱动**: 如需 GPU 加速，请确保安装最新驱动。
 
-### 迁移步骤
-1. **复制整个项目文件夹**: 将 `pj2` 文件夹复制到新电脑。
-2. **初始化 Python 环境**:
-   - 在新电脑上打开终端 (PowerShell 或 CMD)。
-   - 进入项目目录。
-   - 运行 `python -m venv .venv` 创建虚拟环境。
-   - 激活环境: `.venv\Scripts\activate`
-   - 安装依赖: `pip install -r requirements.txt` (如果没有 `requirements.txt`，请先在旧电脑运行 `pip freeze > requirements.txt` 生成)。
-   - **关键依赖**: 确保安装了 `faster-whisper`, `ffmpeg-python`, `opencc`。
-3. **安装 FFmpeg**:
-   - 确保 `ffmpeg` 命令在系统 PATH 中，或者保留 `asr-backend/bin/ffmpeg.exe`。
-4. **运行 DLL 修复脚本**:
-   - 运行 `python setup_libs.py`。这一步非常重要，它会将必要的 CUDA 动态库复制到 `asr-backend` 目录，确保在没有安装完整 CUDA Toolkit 的电脑上也能运行。
-5. **启动软件**:
-   - 安装 Node.js 依赖: `npm install` (如果 `node_modules` 未复制)。
-   - 启动: `npm start`。
+### 操作步骤
+1.  **复制项目**: 将整个项目文件夹复制到新电脑。
+2.  **双击运行**: 在项目根目录下找到 `setup_and_run.bat`，**双击运行**。
+
+该脚本会自动执行以下操作：
+- 创建 Python 虚拟环境 (`.venv`)
+- 安装 Python 依赖 (`requirements.txt`)
+- 自动复制 CUDA 相关的 DLL 文件 (`setup_libs.py`)
+- 安装 Node.js 依赖 (`npm install`)
+- 启动软件
+
+如果脚本运行成功，软件界面将会自动打开。
 
 ---
 
-## 2. 打包为独立安装包 (推荐)
+## 方案二：打包为独立安装包 (推荐用于分发)
 
-为了方便分发给普通用户，可以使用 `electron-builder` 将软件打包成一个 `.exe` 安装包。
+如果你希望生成一个 `.exe` 安装包发给没有安装 Python/Node.js 的用户，请按照以下步骤操作。
 
-### 策略：轻量级打包 + 独立 Python
+### 1. 打包 Python 后端
+首先使用 PyInstaller 将 Python 代码打包为独立可执行文件。
 
-由于 Python 环境和模型文件很大，建议采用 **"Electron 前端打包 + 独立 Python 后端"** 的方式。
+```bash
+# 1. 激活虚拟环境
+.venv\Scripts\activate
 
-**打包内容**:
-- Electron 界面 (UI)
-- Python 解释器及依赖 (精简版)
-- FFmpeg 可执行文件
-- 必要的 DLL 文件
+# 2. 安装 PyInstaller
+pip install pyinstaller
 
-**不打包内容 (让用户联网下载)**:
-- Whisper 模型文件 (Large 模型约 3GB，打包进去会导致安装包过大)。
-- 我们的软件已经实现了 **"模型自动下载"** 功能，用户第一次使用某个模型时会自动下载。
+# 3. 进入后端目录
+cd asr-backend
 
-### 配置步骤 (package.json)
+# 4. 执行打包 (注意：确保 bin 目录存在且包含 ffmpeg.exe)
+pyinstaller --noconfirm --onedir --console --name "engine" --add-data "bin;bin" --add-data "models_manager.py;." transcribe.py
+```
 
-在 `electron/package.json` 中添加 `build` 配置：
+打包完成后，会在 `asr-backend/dist/engine` 生成一个包含 `engine.exe` 的文件夹。
+
+### 2. 修改 Electron 配置
+我们需要告诉 Electron 在打包后使用这个 `engine.exe`，而不是源代码。
+
+**修改 `electron/main.js`**:
+找到定义 `pythonPath` 和 `scriptPath` 的地方，修改为：
+
+```javascript
+const isDev = !app.isPackaged;
+let pythonPath, scriptPath;
+
+if (isDev) {
+  // 开发模式：使用 venv 和源码
+  pythonPath = path.join(__dirname, '../.venv/Scripts/python.exe');
+  scriptPath = path.join(__dirname, '../asr-backend/transcribe.py');
+} else {
+  // 打包模式：使用打包后的 engine.exe
+  // 注意：在打包模式下，engine.exe 就是 "pythonPath"，参数就是 "scriptPath" (这里 scriptPath 可以为空或作为第一个参数)
+  // PyInstaller 打包后的 exe 可以直接运行，不需要再指定 script.py
+  // 所以我们需要调整 spawn 的调用逻辑。
+  
+  // 简化方案：将 engine.exe 视为 python解释器+脚本的合体
+  pythonPath = path.join(process.resourcesPath, 'engine/engine.exe');
+  scriptPath = null; 
+}
+
+// 在 spawn 调用处 (main.js 中有多处 spawn):
+// const args = scriptPath ? [scriptPath, ...] : [...];
+// spawn(pythonPath, args, ...);
+```
+
+### 3. 配置 Electron Builder
+在 `electron/package.json` 中添加构建配置：
 
 ```json
 {
   "scripts": {
-    "start": "electron .",
     "build": "electron-builder"
   },
   "build": {
-    "appId": "com.example.autosub",
-    "productName": "AI Subtitle Generator",
+    "appId": "com.autosub.app",
+    "productName": "AutoSub Tool",
     "directories": {
       "output": "dist"
     },
     "win": {
-      "target": "nsis",
-      "icon": "icon.ico" // 如果有图标
+      "target": "nsis"
     },
     "extraResources": [
       {
-        "from": "../asr-backend",
-        "to": "asr-backend",
-        "filter": ["**/*", "!models/**"] // 排除 models 目录以减小体积
-      },
-      {
-        "from": "../.venv/Scripts/python.exe", 
-        "to": "python/python.exe"
-      },
-      // 注意：直接复制 venv 可能有路径问题，更推荐使用 PyInstaller 打包 Python 后端为单一 exe
+        "from": "../asr-backend/dist/engine",
+        "to": "engine"
+      }
     ]
   }
 }
 ```
 
-### 进阶：使用 PyInstaller 打包后端 (最佳实践)
+### 4. 执行构建
+```bash
+cd electron
+npm run build
+```
 
-为了避免用户安装 Python，最好将 Python 脚本打包成一个独立的 `.exe`。
-
-1. **安装 PyInstaller**: `pip install pyinstaller`
-2. **打包 Python 脚本**:
-   ```bash
-   cd asr-backend
-   pyinstaller --noconfirm --onedir --console --name "engine" --add-data "bin;bin" transcribe.py
-   ```
-   这会在 `asr-backend/dist/engine` 生成可执行文件。
-3. **修改 Electron 调用**:
-   在 `main.js` 中，将 `pythonPath` 和 `scriptPath` 指向打包后的 `engine.exe`。
-4. **Electron Builder 配置**:
-   将 `asr-backend/dist/engine` 文件夹配置到 `extraResources` 中。
-
-这样，用户只需要下载一个约 100-200MB 的安装包，安装后即可使用。模型文件会在需要时自动下载。
+生成的安装包将位于 `electron/dist` 目录下。用户安装后无需配置 Python 环境即可使用。
